@@ -14,9 +14,10 @@ from PySide6.QtCore import Qt, QTimer, QThread, Signal
 from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QComboBox, QDoubleSpinBox, QSpinBox, QCheckBox, QFormLayout,
-    QGroupBox, QDockWidget, QFileDialog, QMessageBox, QInputDialog, QSlider, QTabWidget)
+    QGroupBox, QDockWidget, QFileDialog, QMessageBox, QInputDialog, QSlider, QTabWidget, QScrollArea)
 
 from studio.transport import open_buffer, read_frame, request
+from studio.optics import ASPECTS
 
 ROOT=Path(__file__).resolve().parent.parent
 DEFAULT_BLENDER=Path(r'C:\Program Files\Blender Foundation\Blender 5.2\blender.exe')
@@ -146,7 +147,7 @@ class Studio(QMainWindow):
             toolbar.addAction(title,func)
         self.render_action=toolbar.addAction('高品質PNG',self.render_still)
         dock=QDockWidget('カメラとシーン',self);dock.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
-        panel=QWidget();layout=QVBoxLayout(panel);tabs=QTabWidget();layout.addWidget(tabs)
+        panel=QWidget();layout=QVBoxLayout(panel);tabs=QTabWidget();self.tabs=tabs;layout.addWidget(tabs)
         camera_tab=QWidget();v=QVBoxLayout(camera_tab)
         self.camera_list=QComboBox();self.camera_list.currentIndexChanged.connect(self.switch_camera);v.addWidget(self.camera_list)
         row=QHBoxLayout();self.button('現在位置を複製',self.add_camera,row);self.button('名前変更',self.rename_camera,row);v.addLayout(row)
@@ -166,11 +167,39 @@ class Studio(QMainWindow):
         v.addWidget(group)
         quality=QGroupBox('プレビュー');f=QFormLayout(quality)
         self.preview_mode=QComboBox();self.preview_mode.addItems(['EEVEE（光・被写界深度）','高速（材質色のみ）']);self.preview_mode.currentIndexChanged.connect(self.update_quality);f.addRow('描画方式',self.preview_mode)
-        self.quality=QComboBox();self.quality.addItems(['軽量 480×320','標準 720×480','高品質 1080×720']);self.quality.setCurrentIndex(1)
+        self.quality=QComboBox();self.quality.addItems(['軽量（最大480×320）','標準（最大720×480）','高品質（最大1080×720）']);self.quality.setCurrentIndex(1)
         self.quality.currentIndexChanged.connect(self.update_quality);f.addRow('解像度',self.quality)
         self.target_fps=QSpinBox();self.target_fps.setRange(1,30);self.target_fps.setValue(15);self.target_fps.valueChanged.connect(self.update_quality);f.addRow('目標FPS',self.target_fps)
         self.adaptive=QCheckBox('移動中は解像度を下げる');self.adaptive.setChecked(True);self.adaptive.toggled.connect(self.update_quality);f.addRow(self.adaptive)
         v.addWidget(quality);v.addStretch();tabs.addTab(camera_tab,'カメラ')
+
+        film=QWidget();v=QVBoxLayout(film)
+        group=QGroupBox('フィルムの比率');form=QFormLayout(group)
+        self.aspect=QComboBox()
+        for name,w,h in ASPECTS:self.aspect.addItem(name,(w,h))
+        self.aspect.addItem('カスタム',None);self.aspect.currentIndexChanged.connect(self.choose_aspect);form.addRow('幅:高さ',self.aspect)
+        row=QHBoxLayout();self.aspect_w=number(.1,10000,3,3);self.aspect_h=number(.1,10000,2,3)
+        row.addWidget(self.aspect_w);row.addWidget(QLabel(':'));row.addWidget(self.aspect_h);form.addRow('カスタム比率',row)
+        self.output_edge=QSpinBox();self.output_edge.setRange(256,8192);self.output_edge.setValue(1440);self.output_edge.setSuffix(' px');self.output_edge.setKeyboardTracking(False);form.addRow('高品質出力の長辺',self.output_edge)
+        self.output_size=QLabel('1440×960');form.addRow('出力サイズ',self.output_size)
+        v.addWidget(group)
+        group=QGroupBox('絞り / ボケの形');form=QFormLayout(group)
+        self.bokeh_shape=QComboBox()
+        for name,blades,ratio in [('丸ボケ',0,1),('三角形',3,1),('四角形',4,1),('五角形',5,1),('六角形',6,1),('八角形',8,1),('アナモルフィック（楕円）',0,2),('カスタム',None,None)]:self.bokeh_shape.addItem(name,(blades,ratio))
+        self.bokeh_shape.currentIndexChanged.connect(self.choose_bokeh);form.addRow('形状',self.bokeh_shape)
+        self.blades=QSpinBox();self.blades.setRange(3,16);self.blades.setValue(6);form.addRow('絞り羽根の枚数',self.blades)
+        self.bokeh_rotation=number(-180,180,0,1);self.bokeh_rotation.setSuffix('°');form.addRow('多角形の回転',self.bokeh_rotation)
+        self.bokeh_ratio=number(.1,10,1,2);form.addRow('ボケの縦横比',self.bokeh_ratio)
+        hint=QLabel('被写界深度を有効にして確認します。\n比率1は円形、2は縦長の楕円ボケです。');hint.setWordWrap(True);form.addRow(hint);v.addWidget(group)
+        group=QGroupBox('アナモルフィック風フレア');form=QFormLayout(group)
+        self.flare=QCheckBox('明るい光に横方向の青いフレア');form.addRow(self.flare)
+        self.flare_strength=number(0,5,.5,2);form.addRow('強さ',self.flare_strength)
+        self.flare_threshold=number(0,100,1,2);form.addRow('輝度しきい値',self.flare_threshold)
+        self.flare_fade=number(.5,.99,.92,2);form.addRow('伸び / 減衰',self.flare_fade)
+        hint=QLabel('光源・発光体など、しきい値を超えたハイライトに現れます。\nEEVEEと高品質PNGに反映します。');hint.setWordWrap(True);form.addRow(hint);v.addWidget(group);v.addStretch()
+        for c in [self.aspect_w,self.aspect_h,self.output_edge,self.blades,self.bokeh_rotation,self.bokeh_ratio,self.flare_strength,self.flare_threshold,self.flare_fade]:c.valueChanged.connect(self.update_optics)
+        self.flare.toggled.connect(self.update_optics)
+        scroll=QScrollArea();scroll.setWidgetResizable(True);scroll.setWidget(film);tabs.addTab(scroll,'フィルム / ボケ')
 
         objects=QWidget();v=QVBoxLayout(objects)
         info=QLabel('位置・回転・スケールのキーフレームを編集できます。\n歩行などのリグ動作編集は今後追加します。');info.setWordWrap(True);v.addWidget(info)
@@ -302,6 +331,15 @@ class Studio(QMainWindow):
         if self.autofocus.isChecked():
             self.focus_hint.setText(('追従中: ' if result['dof'] else '被写界深度OFF / 対象設定は保持: ')+self.focus_object.currentText())
         else:self.focus_hint.setText('手動ピント（AFをOFFにすると直前のピント距離を保持）')
+        ratio=result['aspect_w']/result['aspect_h'];index=next((i for i,(_,w,h) in enumerate(ASPECTS) if abs(w/h-ratio)<.00001),len(ASPECTS))
+        self.aspect.setCurrentIndex(index)
+        for c,key in [(self.aspect_w,'aspect_w'),(self.aspect_h,'aspect_h'),(self.output_edge,'output_edge'),(self.bokeh_rotation,'bokeh_rotation'),(self.bokeh_ratio,'bokeh_ratio'),(self.flare_strength,'flare_strength'),(self.flare_threshold,'flare_threshold'),(self.flare_fade,'flare_fade')]:
+            if not c.hasFocus():c.setValue(result[key])
+        self.aspect_w.setEnabled(index==len(ASPECTS));self.aspect_h.setEnabled(index==len(ASPECTS))
+        shape=(0 if abs(result['bokeh_ratio']-1)<.001 else 6) if result['blades']==0 else next((i for i in range(self.bokeh_shape.count()-1) if self.bokeh_shape.itemData(i)[0]==result['blades']),self.bokeh_shape.count()-1)
+        self.bokeh_shape.setCurrentIndex(shape);self.blades.setValue(max(3,result['blades']))
+        self.blades.setEnabled(result['blades']!=0 or shape==self.bokeh_shape.count()-1);self.bokeh_rotation.setEnabled(result['blades']!=0)
+        self.flare.setChecked(result['flare']);self.output_size.setText(f'{result["output_width"]}×{result["output_height"]}')
         for c,key in [(self.start_frame,'start'),(self.end_frame,'end'),(self.fps,'fps'),(self.frame,'frame')]:
             if not c.hasFocus():c.setValue(int(result[key]))
         self.slider.setRange(result['start'],result['end'])
@@ -355,6 +393,28 @@ class Studio(QMainWindow):
         if index>0:
             self.syncing=True;self.focus_object.setCurrentIndex(index);self.syncing=False
             self.select_focus_target()
+
+    def choose_aspect(self):
+        if self.syncing:return
+        preset=self.aspect.currentData();self.syncing=True
+        if preset:self.aspect_w.setValue(preset[0]);self.aspect_h.setValue(preset[1])
+        self.aspect_w.setEnabled(preset is None);self.aspect_h.setEnabled(preset is None)
+        self.syncing=False;self.update_optics()
+
+    def choose_bokeh(self):
+        if self.syncing:return
+        blades,ratio=self.bokeh_shape.currentData();self.syncing=True
+        if blades is not None:
+            self.blades.setValue(max(3,blades));self.bokeh_ratio.setValue(ratio)
+        self.blades.setEnabled(blades!=0);self.bokeh_rotation.setEnabled(blades!=0)
+        self.dof.setChecked(True);self.syncing=False;self.update_lens();self.update_optics()
+
+    def update_optics(self):
+        if self.syncing:return
+        blades=self.bokeh_shape.currentData()[0]
+        self.send('optics',aspect_w=self.aspect_w.value(),aspect_h=self.aspect_h.value(),output_edge=self.output_edge.value(),
+                  blades=0 if blades==0 else self.blades.value(),bokeh_rotation=self.bokeh_rotation.value(),bokeh_ratio=self.bokeh_ratio.value(),
+                  flare=self.flare.isChecked(),flare_strength=self.flare_strength.value(),flare_threshold=self.flare_threshold.value(),flare_fade=self.flare_fade.value())
 
     def update_quality(self):
         w,h=[(480,320),(720,480),(1080,720)][self.quality.currentIndex()]

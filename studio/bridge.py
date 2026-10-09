@@ -18,6 +18,8 @@ from mathutils import Quaternion, Vector
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from studio.transport import HEADER, OFFSET, open_buffer, MAX_WIDTH, MAX_HEIGHT
+from studio.optics import fit_frame
+from studio.blender_optics import initialize_formats,optics_status,apply_active_optics,set_optics
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--port', type=int, required=True)
@@ -72,7 +74,7 @@ def snapshot():
     active_target=cam.data.dof.focus_object
     target_id=object_id(active_target) if active_target else cam.data.get('fcs_focus_target') or None
     if target_id and not any(o.get('fcs_id')==target_id for o in scene.objects):target_id=None
-    return dict(camera=object_id(cam), cameras=[dict(id=object_id(o), name=o.name)
+    return dict(**optics_status(scene,cam),camera=object_id(cam), cameras=[dict(id=object_id(o), name=o.name)
                 for o in scene.objects if o.type == 'CAMERA'],
                 objects=[dict(id=object_id(o), name=o.name, type=o.type)
                          for o in scene.objects if o.type in {'MESH', 'EMPTY', 'ARMATURE'}],
@@ -95,6 +97,8 @@ def key_camera(cam):
     cam.data.keyframe_insert(data_path='lens', group='Lens')
     cam.data.dof.keyframe_insert(data_path='focus_distance', group='Lens')
     cam.data.dof.keyframe_insert(data_path='aperture_fstop', group='Lens')
+    for path in ('aperture_blades','aperture_rotation','aperture_ratio'):
+        cam.data.dof.keyframe_insert(data_path=path,group='Lens')
 
 
 def configure_view():
@@ -122,12 +126,15 @@ def configure_view():
         obj.rotation_euler = (Vector((0, 0, 1))-obj.location).to_track_quat('-Z', 'Y').to_euler()
         scene.camera = obj
     state['frame'] = float(scene.frame_current)
+    initialize_formats(scene);apply_active_optics(scene)
 
 
 def execute(cmd):
     op = cmd['op']; scene = bpy.context.scene
     if op == 'status':
         return snapshot()
+    if op == 'optics':
+        set_optics(scene,cmd);return snapshot()
     if op == 'drive':
         if state['playing'] and not state['recording']:
             return {}
@@ -168,6 +175,7 @@ def execute(cmd):
         obj = find_object(cmd['id'])
         if obj.type != 'CAMERA': raise ValueError('Selected object is not a camera')
         scene.camera = obj
+        apply_active_optics(scene)
         state['dirty'] = True
         return snapshot()
     if op == 'add_camera':
@@ -177,6 +185,7 @@ def execute(cmd):
         new['fcs_id'] = uuid.uuid4().hex
         new.name = cmd.get('name', 'Camera')
         scene.collection.objects.link(new); scene.camera = new
+        apply_active_optics(scene)
         state['dirty'] = True
         return snapshot()
     if op == 'rename_camera':
@@ -184,7 +193,7 @@ def execute(cmd):
         return snapshot()
     if op == 'preview':
         w,h = int(cmd['width']),int(cmd['height'])
-        if not (160 <= w <= MAX_WIDTH and 120 <= h <= MAX_HEIGHT): raise ValueError('Invalid preview dimensions')
+        if not (64 <= w <= MAX_WIDTH and 64 <= h <= MAX_HEIGHT): raise ValueError('Invalid preview dimensions')
         mode=cmd.get('mode','eevee')
         if mode not in {'eevee','solid'}:raise ValueError('Unknown preview mode')
         state.update(width=w, height=h, fps=max(1,min(30,int(cmd.get('fps',15)))), dirty=True, mode=mode, adaptive=bool(cmd.get('adaptive',True)))
@@ -281,8 +290,10 @@ def draw():
     state['draw_busy']=True
     try:
         w,h=state['width'],state['height']
+        cam=camera()
+        w,h=fit_frame(cam.data['fcs_aspect_w'],cam.data['fcs_aspect_h'],w,h)
         if state['adaptive'] and now-state['last_move']<.3:
-            w=max(160,int(w*.67));h=max(120,int(h*.67))
+            w=max(32,round(w*.67));h=max(32,round(h*.67))
         off=state['offscreen']
         if off is None or off.width!=w or off.height!=h:
             if off:off.free()
@@ -321,10 +332,11 @@ def tick():
             if state['recording']:state['recording']=False;state['playing']=False;state['frame']=float(scene.frame_end)
             else:state['frame']=float(scene.frame_start)
         if state['recording']:
-            cam=camera();pose=(cam.location.copy(),cam.rotation_euler.copy(),cam.rotation_quaternion.copy(),tuple(cam.rotation_axis_angle),cam.data.lens,cam.data.dof.focus_distance,cam.data.dof.aperture_fstop)
+            cam=camera();pose=(cam.location.copy(),cam.rotation_euler.copy(),cam.rotation_quaternion.copy(),tuple(cam.rotation_axis_angle),cam.data.lens,cam.data.dof.focus_distance,cam.data.dof.aperture_fstop,cam.data.dof.aperture_blades,cam.data.dof.aperture_rotation,cam.data.dof.aperture_ratio)
         frame=int(state['frame']);scene.frame_set(frame,subframe=state['frame']-frame)
         if state['recording']:
             cam.location=pose[0];cam.rotation_euler=pose[1];cam.rotation_quaternion=pose[2];cam.rotation_axis_angle=pose[3];cam.data.lens=pose[4];cam.data.dof.focus_distance=pose[5];cam.data.dof.aperture_fstop=pose[6]
+            cam.data.dof.aperture_blades=pose[7];cam.data.dof.aperture_rotation=pose[8];cam.data.dof.aperture_ratio=pose[9]
             key_camera(cam)
     for area in bpy.context.screen.areas:
         if area.type=='VIEW_3D':area.tag_redraw()
