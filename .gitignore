@@ -3,3 +3,6 @@ __pycache__/
 studio_output/
 *_log.txt
 *.blend1
+
+*.blend
+*.png
